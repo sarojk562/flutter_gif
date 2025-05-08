@@ -7,15 +7,23 @@
 
 library gif;
 
-import 'dart:ui';
+import 'dart:io';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
-import 'package:http/http.dart';
 
-final Client _sharedHttpClient = Client();
+final HttpClient _sharedHttpClient = HttpClient()..autoUncompress = false;
 
-Client get _httpClient {
-  Client client = _sharedHttpClient;
+HttpClient get _httpClient {
+  HttpClient client = _sharedHttpClient;
+  assert(() {
+    if (debugNetworkImageHttpClientProvider != null) {
+      client = debugNetworkImageHttpClientProvider!();
+    }
+    return true;
+  }());
   return client;
 }
 
@@ -24,7 +32,7 @@ enum Autostart {
   /// Don't start.
   no,
 
-  /// Run once everytime a new gif is loaded.
+  /// Run once every time a new gif is loaded.
   once,
 
   /// Loop playback.
@@ -111,9 +119,9 @@ class Gif extends StatefulWidget {
     this.matchTextDirection = false,
     this.useCache = true,
   })  : assert(
-          fps == null || duration == null,
-          'only one of the two can be set [fps] [duration]',
-        ),
+  fps == null || duration == null,
+  'only one of the two can be set [fps] [duration]',
+  ),
         assert(fps == null || fps > 0, 'fps must be greater than 0'),
         super(key: key);
 
@@ -132,13 +140,11 @@ class GifCache {
   void clear() => caches.clear();
 
   /// Removes single gif from the cache.
-  bool evict(Object key) => caches.remove(key) != null ? true : false;
+  bool evict(Object key) => caches.remove(key) != null;
 }
 
 ///
 /// Controller that wraps [AnimationController] and protects the [duration] parameter.
-/// This falls into a design choice to keep the duration control to the [Gif]
-/// widget.
 ///
 class GifController extends AnimationController {
   @protected
@@ -193,19 +199,19 @@ class _GifState extends State<Gif> with SingleTickerProviderStateMixin {
     return widget.placeholder != null && _frame == null
         ? widget.placeholder!(context)
         : widget.excludeFromSemantics
-            ? image
-            : Semantics(
-                container: widget.semanticLabel != null,
-                image: true,
-                label: widget.semanticLabel ?? '',
-                child: image,
-              );
+        ? image
+        : Semantics(
+      container: widget.semanticLabel != null,
+      image: true,
+      label: widget.semanticLabel ?? '',
+      child: image,
+    );
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _loadFrames().then((value) => _autostart());
+    _loadFrames().then((_) => _autostart());
   }
 
   @override
@@ -219,13 +225,13 @@ class _GifState extends State<Gif> with SingleTickerProviderStateMixin {
     if ((widget.image != oldWidget.image) ||
         (widget.fps != oldWidget.fps) ||
         (widget.duration != oldWidget.duration)) {
-      _loadFrames().then((value) {
+      _loadFrames().then((_) {
         if (widget.image != oldWidget.image) {
           _autostart();
         }
       });
     }
-    if ((widget.autostart != oldWidget.autostart)) {
+    if (widget.autostart != oldWidget.autostart) {
       _autostart();
     }
   }
@@ -249,7 +255,7 @@ class _GifState extends State<Gif> with SingleTickerProviderStateMixin {
   /// Start this gif according to [widget.autostart] and [widget.loop].
   void _autostart() {
     if (mounted && widget.autostart != Autostart.no) {
-      _controller..reset();
+      _controller.reset();
       if (widget.autostart == Autostart.loop) {
         _controller.repeat();
       } else {
@@ -263,54 +269,46 @@ class _GifState extends State<Gif> with SingleTickerProviderStateMixin {
     return provider is NetworkImage
         ? provider.url
         : provider is AssetImage
-            ? provider.assetName
-            : provider is FileImage
-                ? provider.file.path
-                : provider is MemoryImage
-                    ? provider.bytes.toString()
-                    : "";
+        ? provider.assetName
+        : provider is FileImage
+        ? provider.file.path
+        : provider is MemoryImage
+        ? provider.bytes.toString()
+        : '';
   }
 
   /// Calculates the [_frameIndex] based on the [AnimationController] value.
-  ///
-  /// The calculation is based on the frames of the gif
-  /// and the [Duration] of [AnimationController].
   void _listener() {
     if (_frames.isNotEmpty && mounted) {
       setState(() {
-        _frameIndex = _frames.isEmpty
-            ? 0
-            : ((_frames.length - 1) * _controller.value).floor();
+        _frameIndex = ((_frames.length - 1) * _controller.value).floor();
       });
     }
   }
 
   /// Fetches the frames with [_fetchFrames] and saves them into [_frames].
-  ///
-  /// When [_frames] is updated [onFetchCompleted] is called.
   Future<void> _loadFrames() async {
     if (!mounted) return;
 
     GifInfo gif = widget.useCache
-        ? Gif.cache.caches.containsKey(_getImageKey(widget.image))
-            ? Gif.cache.caches[_getImageKey(widget.image)]!
-            : await _fetchFrames(widget.image)
+        ? (Gif.cache.caches[_getImageKey(widget.image)] ??
+        await _fetchFrames(widget.image))
         : await _fetchFrames(widget.image);
 
     if (!mounted) return;
 
-    if (widget.useCache)
+    if (widget.useCache) {
       Gif.cache.caches.putIfAbsent(_getImageKey(widget.image), () => gif);
+    }
 
     setState(() {
       _frames = gif.frames;
       _controller.duration = widget.fps != null
           ? Duration(
-              milliseconds: (_frames.length / widget.fps! * 1000).round())
+        milliseconds: (_frames.length / widget.fps! * 1000).round(),
+      )
           : widget.duration ?? gif.duration;
-      if (widget.onFetchCompleted != null) {
-        widget.onFetchCompleted!();
-      }
+      widget.onFetchCompleted?.call();
     });
   }
 
@@ -320,14 +318,15 @@ class _GifState extends State<Gif> with SingleTickerProviderStateMixin {
 
     if (provider is NetworkImage) {
       final Uri resolved = Uri.base.resolve(provider.url);
-      final Response response = await _httpClient.get(
-        resolved,
-        headers: provider.headers,
+      final HttpClientRequest request = await _httpClient.getUrl(resolved);
+      provider.headers?.forEach(
+            (String name, String value) => request.headers.add(name, value),
       );
-      bytes = response.bodyBytes;
+      final HttpClientResponse response = await request.close();
+      bytes = await consolidateHttpClientResponseBytes(response);
     } else if (provider is AssetImage) {
       AssetBundleImageKey key =
-          await provider.obtainKey(const ImageConfiguration());
+      await provider.obtainKey(const ImageConfiguration());
       bytes = (await key.bundle.load(key.name)).buffer.asUint8List();
     } else if (provider is FileImage) {
       bytes = await provider.file.readAsBytes();
@@ -335,15 +334,13 @@ class _GifState extends State<Gif> with SingleTickerProviderStateMixin {
       bytes = provider.bytes;
     }
 
-    final buffer = await ImmutableBuffer.fromUint8List(bytes);
-    Codec codec = await PaintingBinding.instance.instantiateImageCodecWithSize(
-      buffer,
-    );
+    // Use the top-level instantiateImageCodec API from dart:ui
+    ui.Codec codec = await ui.instantiateImageCodec(bytes);
     List<ImageInfo> infos = [];
     Duration duration = Duration();
 
     for (int i = 0; i < codec.frameCount; i++) {
-      FrameInfo frameInfo = await codec.getNextFrame();
+      ui.FrameInfo frameInfo = await codec.getNextFrame();
       infos.add(ImageInfo(image: frameInfo.image));
       duration += frameInfo.duration;
     }
